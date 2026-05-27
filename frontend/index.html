@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KRX 규정 RAG 챗봇</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-primary: #0f1117;
+  --bg-secondary: #1a1d27;
+  --bg-chat: #13151d;
+  --bg-user-msg: #2563eb;
+  --bg-bot-msg: #1e2130;
+  --bg-step: #181b25;
+  --text-primary: #e8eaf0;
+  --text-secondary: #8b8fa3;
+  --text-muted: #5c6078;
+  --accent: #3b82f6;
+  --accent-glow: rgba(59, 130, 246, 0.15);
+  --border: #2a2d3a;
+  --border-light: #353849;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --font-sans: 'Noto Sans KR', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Layout ─── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+/* ─── Header ─── */
+.header {
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-primary);
+  flex-shrink: 0;
+}
+
+.header-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.header-icon {
+  width: 36px;
+  height: 36px;
+  background: linear-gradient(135deg, var(--accent), #6366f1);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.header h1 {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.header p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding-left: 48px;
+}
+
+/* ─── Chat Area ─── */
+.chat-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: var(--bg-chat);
+  scroll-behavior: smooth;
+}
+
+.chat-area::-webkit-scrollbar { width: 6px; }
+.chat-area::-webkit-scrollbar-track { background: transparent; }
+.chat-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ─── Welcome ─── */
+.welcome {
+  text-align: center;
+  padding: 48px 20px;
+  animation: fadeUp 0.5s ease;
+}
+
+.welcome-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.welcome h2 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.welcome p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 400px;
+  margin: 0 auto 24px;
+}
+
+.examples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 480px;
+  margin: 0 auto;
+}
+
+.example-btn {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  color: var(--text-primary);
+  font-size: 13.5px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+  line-height: 1.4;
+}
+
+.example-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+
+/* ─── Messages ─── */
+.msg {
+  display: flex;
+  gap: 12px;
+  animation: fadeUp 0.3s ease;
+  max-width: 100%;
+}
+
+.msg-user {
+  flex-direction: row-reverse;
+}
+
+.msg-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.msg-user .msg-avatar {
+  background: var(--bg-user-msg);
+}
+
+.msg-bot .msg-avatar {
+  background: linear-gradient(135deg, var(--accent), #6366f1);
+}
+
+.msg-content {
+  max-width: 85%;
+}
+
+.msg-bubble {
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  font-size: 14px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.msg-user .msg-bubble {
+  background: var(--bg-user-msg);
+  border-bottom-right-radius: 4px;
+  color: #fff;
+}
+
+.msg-bot .msg-bubble {
+  background: var(--bg-bot-msg);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.msg-bot .msg-bubble p { margin-bottom: 8px; }
+.msg-bot .msg-bubble p:last-child { margin-bottom: 0; }
+.msg-bot .msg-bubble strong { color: #93c5fd; font-weight: 500; }
+.msg-bot .msg-bubble code {
+  background: rgba(255,255,255,0.06);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+/* ─── Step Indicators ─── */
+.step-trail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: 44px;
+  animation: fadeUp 0.25s ease;
+}
+
+.step-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-step);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.step-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.step-item.searching .step-icon { color: var(--warning); }
+.step-item.found .step-icon { color: var(--success); }
+.step-item.thinking .step-icon { color: var(--accent); }
+
+.step-detail {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+/* ─── Typing Indicator ─── */
+.typing {
+  display: flex;
+  gap: 4px;
+  padding: 4px 0;
+  margin-left: 44px;
+}
+
+.typing span {
+  width: 7px;
+  height: 7px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  animation: bounce 1.2s infinite;
+}
+
+.typing span:nth-child(2) { animation-delay: 0.15s; }
+.typing span:nth-child(3) { animation-delay: 0.3s; }
+
+/* ─── Input Area ─── */
+.input-area {
+  padding: 16px 24px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-primary);
+  flex-shrink: 0;
+}
+
+.input-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.input-row textarea {
+  flex: 1;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  resize: none;
+  line-height: 1.5;
+  min-height: 46px;
+  max-height: 120px;
+  transition: border-color 0.15s;
+  outline: none;
+}
+
+.input-row textarea:focus {
+  border-color: var(--accent);
+}
+
+.input-row textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.send-btn {
+  width: 46px;
+  height: 46px;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  font-size: 18px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.send-btn:hover:not(:disabled) {
+  background: #2563eb;
+  transform: translateY(-1px);
+}
+
+.send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.input-hint {
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+/* ─── Animations ─── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-6px); }
+}
+
+/* ─── Markdown rendering ─── */
+.msg-bubble h3 { font-size: 15px; font-weight: 600; margin: 12px 0 6px; color: #93c5fd; }
+.msg-bubble h4 { font-size: 14px; font-weight: 600; margin: 10px 0 4px; }
+.msg-bubble ul, .msg-bubble ol { padding-left: 20px; margin: 6px 0; }
+.msg-bubble li { margin: 3px 0; }
+.msg-bubble blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 12px;
+  margin: 8px 0;
+  color: var(--text-secondary);
+}
+.msg-bubble hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+/* ─── Responsive ─── */
+@media (max-width: 640px) {
+  .header { padding: 16px 16px 12px; }
+  .chat-area { padding: 16px; }
+  .input-area { padding: 12px 16px 20px; }
+  .msg-content { max-width: 90%; }
+  .step-trail { margin-left: 32px; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-top">
+      <div class="header-icon">⚖</div>
+      <h1>KRX 규정 RAG 챗봇</h1>
+    </div>
+    <p>한국거래소 규정(상장·공시·업무)을 검색하고 답변합니다</p>
+  </div>
+
+  <!-- Chat -->
+  <div class="chat-area" id="chatArea">
+    <div class="welcome" id="welcome">
+      <div class="welcome-icon">📋</div>
+      <h2>KRX 규정에 대해 물어보세요</h2>
+      <p>유가증권시장, 코스닥시장, 코넥스시장의 상장규정, 공시규정, 업무규정 및 시행세칙을 검색하여 답변합니다.</p>
+      <div class="examples">
+        <button class="example-btn" onclick="sendExample(this)">코스닥시장 상장 요건은 무엇인가요?</button>
+        <button class="example-btn" onclick="sendExample(this)">유가증권시장에서 상장폐지 사유에는 어떤 것들이 있나요?</button>
+        <button class="example-btn" onclick="sendExample(this)">코넥스시장의 공시의무에 대해 알려주세요</button>
+        <button class="example-btn" onclick="sendExample(this)">주권상장법인의 주요사항보고서 제출 대상은?</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-area">
+    <div class="input-row">
+      <textarea id="userInput" rows="1" placeholder="KRX 규정에 대해 질문하세요..." 
+                onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
+    </div>
+    <div class="input-hint">Enter로 전송 · Shift+Enter로 줄바꿈</div>
+  </div>
+</div>
+
+<script>
+const API_BASE = 'http://localhost:8000';;
+const chatArea = document.getElementById('chatArea');
+const userInput = document.getElementById('userInput');
+const sendBtn = document.getElementById('sendBtn');
+let isProcessing = false;
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function handleKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function sendExample(btn) {
+  userInput.value = btn.textContent;
+  sendMessage();
+}
+
+function scrollToBottom() {
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function removeWelcome() {
+  const w = document.getElementById('welcome');
+  if (w) w.remove();
+}
+
+function addUserMessage(text) {
+  removeWelcome();
+  const div = document.createElement('div');
+  div.className = 'msg msg-user';
+  div.innerHTML = `
+    <div class="msg-avatar">👤</div>
+    <div class="msg-content">
+      <div class="msg-bubble">${escapeHtml(text)}</div>
+    </div>`;
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+function addTypingIndicator() {
+  const div = document.createElement('div');
+  div.className = 'typing';
+  div.id = 'typingIndicator';
+  div.innerHTML = '<span></span><span></span><span></span>';
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+function removeTypingIndicator() {
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
+function addStepTrail(stepData) {
+  let trail = document.getElementById('currentStepTrail');
+  if (!trail) {
+    trail = document.createElement('div');
+    trail.className = 'step-trail';
+    trail.id = 'currentStepTrail';
+    chatArea.appendChild(trail);
+  }
+
+  const item = document.createElement('div');
+  item.className = 'step-item';
+
+  if (stepData.type === 'policy' && stepData.action === 'CALL_TOOL') {
+    item.classList.add('searching');
+    const args = stepData.tool_args || {};
+    const query = args.query_text || '';
+    const market = args.market ? ` [${args.market}]` : '';
+    item.innerHTML = `<span class="step-icon">🔍</span>
+      <div><div>규정 검색 중...${market}</div>
+      ${query ? `<div class="step-detail">"${escapeHtml(query)}"</div>` : ''}</div>`;
+  } else if (stepData.type === 'tool_executor') {
+    item.classList.add('found');
+    const summary = stepData.summary || '';
+    const matchCount = (summary.match(/건 검색됨/)||[''])[0];
+    item.innerHTML = `<span class="step-icon">✅</span>
+      <div><div>검색 완료: ${escapeHtml(matchCount || summary.slice(0, 60))}</div></div>`;
+  } else if (stepData.type === 'policy' && stepData.action === 'SYNTHESIZE') {
+    item.classList.add('thinking');
+    item.innerHTML = `<span class="step-icon">💭</span><div>답변 생성 중...</div>`;
+  } else if (stepData.type === 'policy' && stepData.action === 'WRITE_NOTE') {
+    item.classList.add('thinking');
+    item.innerHTML = `<span class="step-icon">📝</span><div>메모 작성 중...</div>`;
+  } else {
+    return; // 기타 이벤트는 무시
+  }
+
+  trail.appendChild(item);
+  scrollToBottom();
+}
+
+function createBotMessage() {
+  removeTypingIndicator();
+  const div = document.createElement('div');
+  div.className = 'msg msg-bot';
+  div.innerHTML = `
+    <div class="msg-avatar">⚖</div>
+    <div class="msg-content">
+      <div class="msg-bubble" id="currentBotBubble"></div>
+    </div>`;
+  chatArea.appendChild(div);
+  scrollToBottom();
+  return document.getElementById('currentBotBubble');
+}
+
+function renderMarkdown(text) {
+  // 간단한 마크다운 렌더링
+  let html = escapeHtml(text);
+
+  // 볼드
+  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  // 인라인 코드
+  html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+  // 헤더
+  html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  // 구분선
+  html = html.replace(/^---$/gm, '<hr>');
+  // 리스트
+  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
+  // 인용
+  html = html.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
+  // 줄바꿈 → 단락
+  html = html.replace(/\n\n/g, '</p><p>');
+  html = html.replace(/\n/g, '<br>');
+  html = '<p>' + html + '</p>';
+
+  return html;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function sendMessage() {
+  const text = userInput.value.trim();
+  if (!text || isProcessing) return;
+
+  isProcessing = true;
+  sendBtn.disabled = true;
+  userInput.value = '';
+  userInput.style.height = 'auto';
+
+  addUserMessage(text);
+  addTypingIndicator();
+
+  let botBubble = null;
+  let accumulatedText = '';
+
+  try {
+    const response = await fetch(`${API_BASE}/agent/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let eventType = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          const dataStr = line.slice(6);
+          try {
+            const data = JSON.parse(dataStr);
+
+            if (eventType === 'step') {
+              addStepTrail(data);
+            } else if (eventType === 'token') {
+              if (!botBubble) {
+                botBubble = createBotMessage();
+              }
+              accumulatedText += data.text;
+              botBubble.innerHTML = renderMarkdown(accumulatedText);
+              scrollToBottom();
+            } else if (eventType === 'done') {
+              // 완료
+            } else if (eventType === 'error') {
+              if (!botBubble) botBubble = createBotMessage();
+              botBubble.innerHTML = `<p style="color:#f87171;">오류가 발생했습니다: ${escapeHtml(data.message)}</p>`;
+            }
+          } catch (e) {
+            // JSON 파싱 실패 무시
+          }
+        }
+      }
+    }
+
+  } catch (err) {
+    removeTypingIndicator();
+    if (!botBubble) botBubble = createBotMessage();
+    botBubble.innerHTML = `<p style="color:#f87171;">서버 연결에 실패했습니다. 서버가 실행 중인지 확인해주세요.</p>
+      <p style="color:#f87171;font-size:12px;margin-top:4px;">${escapeHtml(err.message)}</p>`;
+  }
+
+  // 스텝 트레일 ID 제거 (다음 메시지를 위해)
+  const trail = document.getElementById('currentStepTrail');
+  if (trail) trail.removeAttribute('id');
+  const bubble = document.getElementById('currentBotBubble');
+  if (bubble) bubble.removeAttribute('id');
+
+  isProcessing = false;
+  sendBtn.disabled = false;
+  userInput.focus();
+}
+</script>
+
+</body>
+</html>
