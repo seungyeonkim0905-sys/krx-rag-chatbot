@@ -75,43 +75,55 @@ def regulation_search(args: dict[str, Any]) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    where, filter_params = _filter_clause(params.market, params.reg_type)
     top_k = params.top_k
 
     # 1) 동의어 확장
     expanded = expand_query(params.query_text.strip())
 
-    # 2) 다중 쿼리 검색 → 통합
-    merged: dict[int, tuple[float, sqlite3.Row]] = {}
-    for priority, q in enumerate(expanded):
-        fts_q = _fts_escape(q)
-        if not fts_q:
-            continue
-        sql = f"""
-            SELECT r.id, r.regulation_name, r.market, r.article_title,
-                   r.text, regulations_fts.rank AS score
-            FROM regulations_fts
-            JOIN regulations r ON r.id = regulations_fts.rowid
-            WHERE regulations_fts MATCH ? {where}
-            ORDER BY regulations_fts.rank
-            LIMIT ?
-        """
-        try:
-            cur.execute(sql, [fts_q] + filter_params + [top_k * 2])
-            for row in cur.fetchall():
-                # 원본 질의어(priority=0)에 가중치, 동의어는 약간 감점
-                combined = row["score"] + priority * 0.5
-                rid = row["id"]
-                if rid not in merged or combined < merged[rid][0]:
-                    merged[rid] = (combined, row)
-        except sqlite3.OperationalError as e:
-            logger.debug("FTS5 실패 (%s): %s", q[:20], e)
-            continue
+    def _run_fts(where: str, filter_params: list) -> dict:
+        """주어진 필터로 FTS5 다중쿼리 검색을 수행하고 결과를 통합 반환."""
+        merged: dict[int, tuple[float, sqlite3.Row]] = {}
+        for priority, q in enumerate(expanded):
+            fts_q = _fts_escape(q)
+            if not fts_q:
+                continue
+            sql = f"""
+                SELECT r.id, r.regulation_name, r.market, r.article_title,
+                       r.text, regulations_fts.rank AS score
+                FROM regulations_fts
+                JOIN regulations r ON r.id = regulations_fts.rowid
+                WHERE regulations_fts MATCH ? {where}
+                ORDER BY regulations_fts.rank
+                LIMIT ?
+            """
+            try:
+                cur.execute(sql, [fts_q] + filter_params + [top_k * 2])
+                for row in cur.fetchall():
+                    combined = row["score"] + priority * 0.5
+                    rid = row["id"]
+                    if rid not in merged or combined < merged[rid][0]:
+                        merged[rid] = (combined, row)
+            except sqlite3.OperationalError as e:
+                logger.debug("FTS5 실패 (%s): %s", q[:20], e)
+                continue
+        return merged
 
-    # 3) 폴백: 공백제거 + LIKE
+    # 2) 1차 검색: Policy가 지정한 필터(market/reg_type) 적용
+    where, filter_params = _filter_clause(params.market, params.reg_type)
+    merged = _run_fts(where, filter_params)
+
+    # 3) 안전장치: 필터를 걸었는데 0건이면, 필터를 빼고 재검색
+    #    (Policy가 잘못된 reg_type/market 필터를 거는 경우를 자동 보정)
+    if not merged and (params.market or params.reg_type):
+        logger.info("필터 적용 시 0건 - 필터 제거 후 재검색 (market=%s, reg_type=%s)",
+                    params.market, params.reg_type)
+        merged = _run_fts("", [])
+
+    # 4) 폴백: 그래도 0건이면 LIKE (필터 없이)
     if not merged:
         logger.info("FTS5 결과 없음 - LIKE 폴백")
-        for row in _fallback_like(cur, params, where, filter_params):
+        no_filter = RegulationSearchInput(query_text=params.query_text, top_k=top_k)
+        for row in _fallback_like(cur, no_filter, "", []):
             merged[row["id"]] = (0.0, row)
 
     # 4) 재정렬 후 상위 top_k
