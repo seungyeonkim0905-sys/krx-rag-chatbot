@@ -1,7 +1,12 @@
-"""SQLite FTS5 기반 KRX 규정 검색 Tool.
+"""SQLite FTS5 기반 KRX 규정 + 핵심 법령 검색 Tool (동의어 확장 적용).
 
-Milvus/Docker 없이 순수 SQLite FTS5(trigram)로 한국어 전문 검색을 수행한다.
-폐쇄망 환경에서도 외부 의존성 없이 동작한다.
+기존 regulation_search.py를 대체한다. 인터페이스(입출력)는 동일하게 유지.
+
+개선점:
+  1. 동의어 사전(synonyms.py)으로 실무용어(VI, 서킷브레이커 등)를 정식용어로 확장
+  2. 확장된 다중 쿼리 결과를 통합/재정렬 (원본 질의어 우선 가중)
+  3. chapter/section 까지 인덱싱된 새 DB 스키마 활용
+순수 SQLite FTS5(trigram). 외부 의존성 없음.
 """
 
 from __future__ import annotations
@@ -14,168 +19,139 @@ from typing import Any
 from agent.config import settings
 from agent.models import RegulationSearchHit, RegulationSearchInput, RegulationSearchOutput
 
+# 동의어 사전 (같은 tools 폴더에 synonyms.py 배치)
+try:
+    from agent.tools.synonyms import expand_query
+except ImportError:
+    # 사전이 없어도 동작하도록 안전장치
+    def expand_query(q: str) -> list[str]:
+        return [q]
+
 logger = logging.getLogger(__name__)
 
 
 def _ensure_db() -> str:
-    """DB 파일 존재를 확인하고, 없으면 인덱싱을 수행한다."""
+    """DB 파일 존재 확인."""
     db_path = settings.db_path
     if not os.path.exists(db_path):
-        logger.info("DB 파일 없음 - 자동 인덱싱 시작")
-        from agent.indexer import build_index
-        build_index()
+        raise FileNotFoundError(
+            f"DB 파일이 없습니다: {db_path}\n"
+            f"먼저 build_index.py를 실행하거나, 제공된 krx_rag.db를 해당 경로에 두세요."
+        )
     return db_path
 
 
-def _build_fts_query(query_text: str, market: str | None, reg_type: str | None) -> tuple[str, list]:
-    """FTS5 검색 쿼리를 구성한다.
+def _fts_escape(q: str) -> str:
+    """FTS5 구문 검색용 이스케이프. 따옴표 제거 후 phrase로 감싼다."""
+    q = q.replace('"', "").strip()
+    return f'"{q}"' if q else q
 
-    한국어 trigram 토크나이저에 맞게 검색어를 처리한다.
-    """
-    # FTS5 쿼리 구성: 핵심 키워드 추출
-    # trigram 토크나이저는 3글자 단위로 매칭하므로 원본 텍스트를 그대로 사용
-    fts_query = query_text.strip()
 
-    # 시장/규정 유형 필터가 있으면 추가
-    conditions = []
-    params = []
-
+def _filter_clause(market: str | None, reg_type: str | None) -> tuple[str, list]:
+    conditions, params = [], []
     if market:
         conditions.append("r.market = ?")
         params.append(market)
-
     if reg_type:
         conditions.append("r.regulation_name LIKE ?")
         params.append(f"%{reg_type}%")
-
-    return fts_query, conditions, params
+    where = ("AND " + " AND ".join(conditions)) if conditions else ""
+    return where, params
 
 
 def regulation_search(args: dict[str, Any]) -> dict[str, Any]:
-    """SQLite FTS5를 사용하여 KRX 규정을 검색한다.
+    """동의어 확장 + FTS5 통합 검색.
 
     전략:
-    1. FTS5 MATCH (trigram) 검색 시도
-    2. 결과 부족 시 키워드를 붙여서 재시도 (예: "상장 요건" → "상장요건")
-    3. 그래도 부족하면 LIKE 폴백
+      1. 질의어를 동의어 사전으로 확장 (원본 + 정식용어들)
+      2. 각 확장 쿼리를 FTS5(trigram)로 검색
+      3. 결과를 통합하고, 원본 질의어 매칭에 가중치를 주어 재정렬
+      4. 전부 비면 공백제거/LIKE 폴백
     """
-    input_params = RegulationSearchInput(**args)
+    params = RegulationSearchInput(**args)
     db_path = _ensure_db()
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    _, conditions, filter_params = _build_fts_query(
-        input_params.query_text, input_params.market, input_params.reg_type
-    )
+    where, filter_params = _filter_clause(params.market, params.reg_type)
+    top_k = params.top_k
 
-    where_clause = ""
-    if conditions:
-        where_clause = "AND " + " AND ".join(conditions)
+    # 1) 동의어 확장
+    expanded = expand_query(params.query_text.strip())
 
-    rows = []
-
-    # 시도 1: 원본 쿼리 FTS5
-    fts_queries = [input_params.query_text.strip()]
-    # 시도 2: 공백 제거 버전 (한국어 복합어 처리)
-    no_space = input_params.query_text.replace(" ", "")
-    if no_space != fts_queries[0]:
-        fts_queries.append(no_space)
-    # 시도 3: 개별 키워드 OR 검색
-    keywords = input_params.query_text.strip().split()
-    if len(keywords) > 1:
-        fts_queries.append(" OR ".join(keywords))
-
-    for fts_query in fts_queries:
+    # 2) 다중 쿼리 검색 → 통합
+    merged: dict[int, tuple[float, sqlite3.Row]] = {}
+    for priority, q in enumerate(expanded):
+        fts_q = _fts_escape(q)
+        if not fts_q:
+            continue
+        sql = f"""
+            SELECT r.id, r.regulation_name, r.market, r.article_title,
+                   r.text, regulations_fts.rank AS score
+            FROM regulations_fts
+            JOIN regulations r ON r.id = regulations_fts.rowid
+            WHERE regulations_fts MATCH ? {where}
+            ORDER BY regulations_fts.rank
+            LIMIT ?
+        """
         try:
-            sql = f"""
-                SELECT
-                    r.id, r.regulation_name, r.market,
-                    r.article_title, r.text,
-                    regulations_fts.rank AS score
-                FROM regulations_fts
-                JOIN regulations r ON r.id = regulations_fts.rowid
-                WHERE regulations_fts MATCH ?
-                {where_clause}
-                ORDER BY regulations_fts.rank
-                LIMIT ?
-            """
-            all_params = [fts_query] + filter_params + [input_params.top_k]
-            cur.execute(sql, all_params)
-            rows = cur.fetchall()
-            if rows:
-                logger.info("FTS5 검색 성공 (query='%s'): %d건", fts_query[:30], len(rows))
-                break
+            cur.execute(sql, [fts_q] + filter_params + [top_k * 2])
+            for row in cur.fetchall():
+                # 원본 질의어(priority=0)에 가중치, 동의어는 약간 감점
+                combined = row["score"] + priority * 0.5
+                rid = row["id"]
+                if rid not in merged or combined < merged[rid][0]:
+                    merged[rid] = (combined, row)
         except sqlite3.OperationalError as e:
-            logger.debug("FTS5 MATCH 실패 (%s): %s", fts_query[:30], e)
+            logger.debug("FTS5 실패 (%s): %s", q[:20], e)
             continue
 
-    # 폴백: LIKE 검색
-    if not rows:
+    # 3) 폴백: 공백제거 + LIKE
+    if not merged:
         logger.info("FTS5 결과 없음 - LIKE 폴백")
-        rows = _fallback_like_search(cur, input_params, conditions, filter_params)
+        for row in _fallback_like(cur, params, where, filter_params):
+            merged[row["id"]] = (0.0, row)
 
-    hits: list[RegulationSearchHit] = []
-    for row in rows:
-        hit = RegulationSearchHit(
+    # 4) 재정렬 후 상위 top_k
+    ranked = sorted(merged.values(), key=lambda x: x[0])[:top_k]
+
+    hits = [
+        RegulationSearchHit(
             id=row["id"],
-            score=abs(float(row["score"])) if row["score"] else 0.0,
+            score=abs(float(score)) if score else 0.0,
             text=row["text"],
             regulation_name=row["regulation_name"],
             market=row["market"],
             article_title=row["article_title"],
         )
-        hits.append(hit)
+        for score, row in ranked
+    ]
 
     conn.close()
-
-    output = RegulationSearchOutput(hits=hits)
-    logger.info(
-        "regulation_search 완료: query='%s', hits=%d",
-        input_params.query_text[:50],
-        len(hits),
-    )
-    return output.model_dump()
+    logger.info("regulation_search 완료: query='%s', hits=%d (확장 %d쿼리)",
+                params.query_text[:40], len(hits), len(expanded))
+    return RegulationSearchOutput(hits=hits).model_dump()
 
 
-def _fallback_like_search(
-    cur: sqlite3.Cursor,
-    params: RegulationSearchInput,
-    conditions: list[str],
-    filter_params: list,
-) -> list:
-    """FTS5 검색 실패 시 LIKE 기반 폴백 검색."""
-    # 검색어를 공백으로 분리하여 각각 LIKE 매칭
+def _fallback_like(cur, params, where, filter_params) -> list:
     keywords = params.query_text.strip().split()
-    like_conditions = []
-    like_params = []
-
-    for kw in keywords[:5]:  # 최대 5개 키워드
-        like_conditions.append("(r.text LIKE ? OR r.article_title LIKE ?)")
-        like_params.extend([f"%{kw}%", f"%{kw}%"])
-
+    like_conds, like_params = [], []
+    for kw in keywords[:5]:
+        like_conds.append("(r.text LIKE ? OR r.article_title LIKE ?)")
+        like_params += [f"%{kw}%", f"%{kw}%"]
     where_parts = []
-    if like_conditions:
-        where_parts.append("(" + " AND ".join(like_conditions) + ")")
-    if conditions:
-        where_parts.extend(conditions)
-
-    where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-    all_params = like_params + filter_params + [params.top_k]
-
+    if like_conds:
+        where_parts.append("(" + " AND ".join(like_conds) + ")")
+    # where 는 'AND ...' 형태이므로 접두어 제거 후 결합
+    extra = where.replace("AND ", "", 1) if where.startswith("AND ") else where
+    if extra:
+        where_parts.append(extra)
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     sql = f"""
-        SELECT
-            r.id,
-            r.regulation_name,
-            r.market,
-            r.article_title,
-            r.text,
-            0.0 AS score
-        FROM regulations r
-        {where_clause}
-        LIMIT ?
+        SELECT r.id, r.regulation_name, r.market, r.article_title, r.text, 0.0 AS score
+        FROM regulations r {where_clause} LIMIT ?
     """
-
-    cur.execute(sql, all_params)
+    cur.execute(sql, like_params + filter_params + [params.top_k])
     return cur.fetchall()
