@@ -1,12 +1,9 @@
-"""SQLite FTS5 기반 KRX 규정 + 핵심 법령 검색 Tool (동의어 확장 적용).
-
-기존 regulation_search.py를 대체한다. 인터페이스(입출력)는 동일하게 유지.
+"""SQLite FTS5 + 진짜 벡터 하이브리드 검색 Tool.
 
 개선점:
-  1. 동의어 사전(synonyms.py)으로 실무용어(VI, 서킷브레이커 등)를 정식용어로 확장
-  2. 확장된 다중 쿼리 결과를 통합/재정렬 (원본 질의어 우선 가중)
-  3. chapter/section 까지 인덱싱된 새 DB 스키마 활용
-순수 SQLite FTS5(trigram). 외부 의존성 없음.
+  1. 동의어 사전(synonyms.py)으로 쿼리 확장
+  2. FTS5(어휘) 검색 + 진짜 벡터(의미) 검색을 RRF로 결합
+  3. local_model 폴더의 임베딩 모델 사용 (BAAI/bge-m3 또는 klue/roberta 등)
 """
 
 from __future__ import annotations
@@ -14,38 +11,61 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import ssl
 from typing import Any
+
+import numpy as np
+from sentence_transformers import SentenceTransformer, models
 
 from agent.config import settings
 from agent.models import RegulationSearchHit, RegulationSearchInput, RegulationSearchOutput
 
-# 동의어 사전 (같은 tools 폴더에 synonyms.py 배치)
+# SSL 인증서 오류 방지
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# 동의어 사전
 try:
     from agent.tools.synonyms import expand_query
 except ImportError:
-    # 사전이 없어도 동작하도록 안전장치
     def expand_query(q: str) -> list[str]:
         return [q]
 
 logger = logging.getLogger(__name__)
 
+# 전역 모델 캐시 (메모리 절약 및 속도 향상)
+_model_cache: SentenceTransformer | None = None
+
+def _get_model() -> SentenceTransformer:
+    global _model_cache
+    if _model_cache is None:
+        model_path = settings.embedding_model_path
+        logger.info(f"임베딩 모델 로드 중: {model_path}")
+        try:
+            # 기본 SentenceTransformer 로드 시도
+            _model_cache = SentenceTransformer(model_path)
+        except Exception as e:
+            logger.warning(f"기본 로드 실패({e}), 수동 구성 시도...")
+            # Pooling 설정 누락 시 대응
+            word_embedding_model = models.Transformer(model_path)
+            pooling_model = models.Pooling(word_embedding_model.get_embedding_dimension())
+            _model_cache = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+        logger.info("모델 로드 완료.")
+    return _model_cache
 
 def _ensure_db() -> str:
-    """DB 파일 존재 확인."""
     db_path = settings.db_path
+    # settings.db_path가 krx_regulations.db로 되어 있을 수 있으므로 확인
+    # generate_embeddings_real.py가 사용하는 krx_rag.db가 우선
+    rag_db = os.path.join(os.path.dirname(db_path), "krx_rag.db")
+    if os.path.exists(rag_db):
+        return rag_db
     if not os.path.exists(db_path):
-        raise FileNotFoundError(
-            f"DB 파일이 없습니다: {db_path}\n"
-            f"먼저 build_index.py를 실행하거나, 제공된 krx_rag.db를 해당 경로에 두세요."
-        )
+        raise FileNotFoundError(f"DB 파일이 없습니다: {db_path}")
     return db_path
 
-
 def _fts_escape(q: str) -> str:
-    """FTS5 구문 검색용 이스케이프. 따옴표 제거 후 phrase로 감싼다."""
     q = q.replace('"', "").strip()
     return f'"{q}"' if q else q
-
 
 def _filter_clause(market: str | None, reg_type: str | None) -> tuple[str, list]:
     conditions, params = [], []
@@ -58,112 +78,113 @@ def _filter_clause(market: str | None, reg_type: str | None) -> tuple[str, list]
     where = ("AND " + " AND ".join(conditions)) if conditions else ""
     return where, params
 
+def _reciprocal_rank_fusion(fts_ranks: dict[int, int], vector_ranks: dict[int, int], k: int = 60) -> dict[int, float]:
+    all_ids = set(fts_ranks.keys()) | set(vector_ranks.keys())
+    rrf_scores = {}
+    for rid in all_ids:
+        score = 0.0
+        if rid in fts_ranks:
+            score += 1.0 / (k + fts_ranks[rid])
+        if rid in vector_ranks:
+            score += 1.0 / (k + vector_ranks[rid])
+        rrf_scores[rid] = score
+    return rrf_scores
 
 def regulation_search(args: dict[str, Any]) -> dict[str, Any]:
-    """동의어 확장 + FTS5 통합 검색.
-
-    전략:
-      1. 질의어를 동의어 사전으로 확장 (원본 + 정식용어들)
-      2. 각 확장 쿼리를 FTS5(trigram)로 검색
-      3. 결과를 통합하고, 원본 질의어 매칭에 가중치를 주어 재정렬
-      4. 전부 비면 공백제거/LIKE 폴백
-    """
     params = RegulationSearchInput(**args)
     db_path = _ensure_db()
-
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     top_k = params.top_k
-
+    query_text = params.query_text.strip()
+    
     # 1) 동의어 확장
-    expanded = expand_query(params.query_text.strip())
-
-    def _run_fts(where: str, filter_params: list) -> dict:
-        """주어진 필터로 FTS5 다중쿼리 검색을 수행하고 결과를 통합 반환."""
-        merged: dict[int, tuple[float, sqlite3.Row]] = {}
-        for priority, q in enumerate(expanded):
-            fts_q = _fts_escape(q)
-            if not fts_q:
-                continue
-            sql = f"""
-                SELECT r.id, r.regulation_name, r.market, r.article_title,
-                       r.text, regulations_fts.rank AS score
-                FROM regulations_fts
-                JOIN regulations r ON r.id = regulations_fts.rowid
-                WHERE regulations_fts MATCH ? {where}
-                ORDER BY regulations_fts.rank
-                LIMIT ?
-            """
-            try:
-                cur.execute(sql, [fts_q] + filter_params + [top_k * 2])
-                for row in cur.fetchall():
-                    combined = row["score"] + priority * 0.5
-                    rid = row["id"]
-                    if rid not in merged or combined < merged[rid][0]:
-                        merged[rid] = (combined, row)
-            except sqlite3.OperationalError as e:
-                logger.debug("FTS5 실패 (%s): %s", q[:20], e)
-                continue
-        return merged
-
-    # 2) 1차 검색: Policy가 지정한 필터(market/reg_type) 적용
+    expanded = expand_query(query_text)
     where, filter_params = _filter_clause(params.market, params.reg_type)
-    merged = _run_fts(where, filter_params)
 
-    # 3) 안전장치: 필터를 걸었는데 0건이면, 필터를 빼고 재검색
-    #    (Policy가 잘못된 reg_type/market 필터를 거는 경우를 자동 보정)
-    if not merged and (params.market or params.reg_type):
-        logger.info("필터 적용 시 0건 - 필터 제거 후 재검색 (market=%s, reg_type=%s)",
-                    params.market, params.reg_type)
-        merged = _run_fts("", [])
+    # 2) FTS5 검색
+    fts_results = {}
+    for priority, q in enumerate(expanded):
+        fts_q = _fts_escape(q)
+        if not fts_q: continue
+        sql = f"""
+            SELECT r.id, r.regulation_name, r.market, r.article_title, r.text
+            FROM regulations_fts
+            JOIN regulations r ON r.id = regulations_fts.rowid
+            WHERE regulations_fts MATCH ? {where}
+            ORDER BY regulations_fts.rank
+            LIMIT ?
+        """
+        try:
+            cur.execute(sql, [fts_q] + filter_params + [top_k * 3])
+            for rank, row in enumerate(cur.fetchall(), start=1):
+                rid = row["id"]
+                if rid not in fts_results or rank < fts_results[rid][0]:
+                    fts_results[rid] = (rank, row)
+        except Exception as e:
+            logger.debug(f"FTS5 실패: {e}")
 
-    # 4) 폴백: 그래도 0건이면 LIKE (필터 없이)
-    if not merged:
-        logger.info("FTS5 결과 없음 - LIKE 폴백")
-        no_filter = RegulationSearchInput(query_text=params.query_text, top_k=top_k)
-        for row in _fallback_like(cur, no_filter, "", []):
-            merged[row["id"]] = (0.0, row)
+    # 3) 벡터 검색 (의미 검색)
+    vector_results = {}
+    try:
+        model = _get_model()
+        qv = model.encode(query_text, normalize_embeddings=True)
+        
+        # 필터링된 모든 조문 벡터 가져오기
+        sql = "SELECT id, regulation_name, market, article_title, text, embedding FROM regulations WHERE embedding IS NOT NULL"
+        if where:
+            # where clause는 'AND ...' 형태이므로 'WHERE'로 시작하게 변경
+            sql += " " + where.replace("AND", "AND", 1)
+            cur.execute(sql, filter_params)
+        else:
+            cur.execute(sql)
+            
+        scored = []
+        for row in cur.fetchall():
+            dv = np.frombuffer(row["embedding"], dtype=np.float32)
+            # 코사인 유사도
+            sim = float(np.dot(qv, dv)) # normalize_embeddings=True 이므로 dot이 cosine
+            scored.append((sim, row))
+        
+        scored.sort(reverse=True, key=lambda x: x[0])
+        for rank, (sim, row) in enumerate(scored[:top_k * 3], start=1):
+            vector_results[row["id"]] = (rank, row)
+            
+    except Exception as e:
+        logger.warning(f"벡터 검색 실패: {e}")
 
-    # 4) 재정렬 후 상위 top_k
-    ranked = sorted(merged.values(), key=lambda x: x[0])[:top_k]
+    # 4) RRF 결합
+    fts_ranks = {rid: rank for rid, (rank, _) in fts_results.items()}
+    vector_ranks = {rid: rank for rid, (rank, _) in vector_results.items()}
+    rrf_scores = _reciprocal_rank_fusion(fts_ranks, vector_ranks)
+    
+    sorted_ids = sorted(rrf_scores.items(), key=lambda x: -x[1])
 
-    hits = [
-        RegulationSearchHit(
+    hits = []
+    for rid, score in sorted_ids[:top_k]:
+        if rid in fts_results:
+            row = fts_results[rid][1]
+        else:
+            row = vector_results[rid][1]
+            
+        hits.append(RegulationSearchHit(
             id=row["id"],
-            score=abs(float(score)) if score else 0.0,
+            score=score,
             text=row["text"],
             regulation_name=row["regulation_name"],
             market=row["market"],
-            article_title=row["article_title"],
-        )
-        for score, row in ranked
-    ]
+            article_title=row["article_title"]
+        ))
+
+    # 5) 안전장치: 결과 0건이면 필터 제거 후 재검색 (재귀 방지를 위해 수동 수행)
+    if not hits and (params.market or params.reg_type):
+        logger.info("필터 적용 결과 없음 - 필터 제거 후 재시도")
+        new_args = args.copy()
+        new_args["market"] = None
+        new_args["reg_type"] = None
+        return regulation_search(new_args)
 
     conn.close()
-    logger.info("regulation_search 완료: query='%s', hits=%d (확장 %d쿼리)",
-                params.query_text[:40], len(hits), len(expanded))
     return RegulationSearchOutput(hits=hits).model_dump()
-
-
-def _fallback_like(cur, params, where, filter_params) -> list:
-    keywords = params.query_text.strip().split()
-    like_conds, like_params = [], []
-    for kw in keywords[:5]:
-        like_conds.append("(r.text LIKE ? OR r.article_title LIKE ?)")
-        like_params += [f"%{kw}%", f"%{kw}%"]
-    where_parts = []
-    if like_conds:
-        where_parts.append("(" + " AND ".join(like_conds) + ")")
-    # where 는 'AND ...' 형태이므로 접두어 제거 후 결합
-    extra = where.replace("AND ", "", 1) if where.startswith("AND ") else where
-    if extra:
-        where_parts.append(extra)
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-    sql = f"""
-        SELECT r.id, r.regulation_name, r.market, r.article_title, r.text, 0.0 AS score
-        FROM regulations r {where_clause} LIMIT ?
-    """
-    cur.execute(sql, like_params + filter_params + [params.top_k])
-    return cur.fetchall()

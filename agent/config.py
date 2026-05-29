@@ -20,6 +20,9 @@ class Settings(BaseSettings):
 
     # Data
     regulations_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "krx_regulations")
+    
+    # Embedding
+    embedding_model_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_model")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

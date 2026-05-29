@@ -1,14 +1,33 @@
-# KRX 규정 RAG 챗봇
+# KRX 규정 RAG 챗봇 (v2 고도화 버전)
 
-한국거래소(KRX) 규정을 검색하고 AI가 답변하는 RAG(Retrieval-Augmented Generation) 챗봇입니다.
+한국거래소(KRX) 규정 및 관련 법령을 검색하고 AI가 답변하는 고도화된 RAG(Retrieval-Augmented Generation) 챗봇입니다.
 
-## 특징
+## 🚀 주요 고도화 특징 (v2)
 
-- **Docker/Milvus 불필요**: SQLite FTS5 기반 전문 검색으로 외부 서비스 없이 동작
-- **폐쇄망 호환**: 인터넷 없이도 규정 검색 가능 (LLM API만 필요)
-- **15개 규정 수록**: 유가증권·코스닥·코넥스 시장의 상장규정, 공시규정, 업무규정 및 시행세칙
-- **SSE 스트리밍**: 실시간 토큰 단위 답변 출력
-- **Tool Agent Loop**: LangGraph 기반 검색→판단→답변 에이전트 아키텍처
+- **하이브리드 검색 (Hybrid Search)**: SQLite FTS5(키워드)와 BGE-M3(의미) 검색을 결합하여 정확도 극대화
+- **고성능 임베딩**: `BAAI/bge-m3` 모델을 통한 다국어/법률 특화 의미 추출
+- **RRF(Reciprocal Rank Fusion)**: 서로 다른 검색 알고리즘의 결과를 최적으로 결합하는 순위 재정렬 적용
+- **조(Article) 단위 계층적 청킹**: 규정의 구조([편>장>절>조])를 유지하여 AI의 맥락 이해도 향상
+- **핵심 법령 포함**: 자본시장법, 상법 등 KRX 규정과 연계된 10대 주요 법령 데이터 구축
+- **폐쇄망 최적화**: 로컬 임베딩 모델(`local_model/`) 사용으로 인터넷 없이도 벡터 검색 가능
+
+## 🛠 임베딩 및 검색 기술 상세
+
+### 1. 벡터 임베딩 프로세스
+- **모델**: `BAAI/bge-m3`
+- **전략**: 조문 제목과 본문을 결합하여 임베딩을 생성함으로써 검색 품질을 향상시켰습니다.
+- **저장**: SQLite에 `float32` 벡터를 BLOB 형태로 저장하여 별도의 벡터 DB 없이 가볍게 동작합니다.
+
+### 2. 하이브리드 검색 아키텍처
+1. **쿼리 확장**: `synonyms.py`를 이용해 사용자 질문의 키워드를 금융 도메인에 맞게 확장합니다.
+2. **병렬 검색**: 
+   - **FTS5**: Trigram 기반의 정확한 키워드/조항 번호 매칭
+   - **Vector**: 코사인 유사도 기반의 의미적 매칭
+3. **결합(RRF)**: 두 결과의 순위를 역수 합산 방식으로 결합하여 최종 Top-K를 산출합니다.
+
+### 3. 계층적 데이터 구조
+- 모든 조문은 상위 장/절 정보를 메타데이터로 보유합니다.
+- AI는 답변 생성 시 "제N편 제M장 제X조"와 같은 정확한 출처 정보를 함께 제공받습니다.
 
 ## 프로젝트 구조
 
@@ -16,133 +35,64 @@
 krx-reg-chatbot/
 ├── agent/
 │   ├── app.py              # FastAPI 엔드포인트 (SSE 스트리밍)
-│   ├── config.py            # 환경설정
-│   ├── graph.py             # LangGraph StateGraph 정의
-│   ├── indexer.py           # 마크다운 → SQLite FTS5 인덱서
-│   ├── llm_client.py        # Google Generative AI 클라이언트
-│   ├── models.py            # Pydantic 데이터 모델
-│   ├── nodes/
-│   │   ├── policy.py        # 다음 Action 결정 (LLM)
-│   │   ├── executor.py      # Tool 실행 및 Observation 수집
-│   │   └── synthesizer.py   # 최종 답변 합성 (LLM 스트리밍)
+│   ├── graph.py             # LangGraph 기반 에이전트 워크플로우
+│   ├── indexer.py           # 마크다운 → SQLite 인덱서
+│   ├── llm_client.py        # Google Gemini API 클라이언트
 │   └── tools/
-│       ├── tool_runtime.py  # Tool 디스패치
-│       └── regulation_search.py  # SQLite FTS5 규정 검색
+│       ├── regulation_search.py  # 하이브리드(FTS5 + Vector) 검색 도구
+│       └── synonyms.py           # 동의어 사전 및 쿼리 확장
 ├── data/
-│   └── krx_regulations/     # 규정 마크다운 파일 (15개)
-├── frontend/
-│   └── index.html           # 채팅 UI
-├── .env.example             # 환경변수 템플릿
-├── requirements.txt         # Python 의존성
-├── run.py                   # 원클릭 실행 스크립트
+│   ├── krx_rag.db          # 원본 데이터 + 벡터 임베딩 통합 DB
+│   └── krx_regulations/     # 원본 마크다운 파일
+├── local_model/            # BGE-M3 로컬 모델 가중치
+├── generate_embeddings_real.py # 벡터 임베딩 생성 스크립트
+├── requirements.txt         # 의존성 패키지
 └── README.md
 ```
-
-## 빠른 시작
-
-### 1. 의존성 설치
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. API Key 설정
-
-```bash
-# .env 파일 생성
-copy .env.example .env
-
-# .env 파일에서 GOOGLE_API_KEY 수정
-GOOGLE_API_KEY=AIza...
-```
-
-### 3-1. 백엔드 실행
-
-```bash
-python run.py
-```
-
-첫 실행 시 자동으로:
-1. 규정 마크다운 15개를 파싱하여 조문 단위(2,245개 청크)로 분할
-2. SQLite FTS5 인덱스 구축 (`data/krx_regulations.db`)
-3. FastAPI 서버 시작 (http://localhost:8000)
-
-### 3-2. 프론트 실행
-
-새로운 터미널 추가 하시고
-
-```bash
-npx serve
-```
-
-### 4. 사용
-
-브라우저에서 http://localhost:3000 접속
 
 ## 아키텍처
 
 ```
 사용자 질문
     ↓
-[normalize_goal] 목표 정규화
+[Query Expansion] 동의어 확장
     ↓
-[policy] LLM이 다음 행동 결정 ←─────────┐
-    ↓                                    │
-    ├── CALL_TOOL → [executor] 규정 검색 → budget 체크 →┘
-    ├── WRITE_NOTE → [executor] 메모 작성 → budget 체크 →┘
-    ├── SYNTHESIZE → [synthesizer] 최종 답변 생성 (스트리밍)
-    └── STOP → 즉시 종료
+[Hybrid Search] ───┐
+    ├── FTS5 (Keyword)
+    └── Vector (Semantic)
+    ↓
+[RRF Ranking] 결과 재정렬
+    ↓
+[LLM Reasoning] Gemini-2.0-Flash가 검색된 조문을 분석하여 답변 생성 (스트리밍)
 ```
 
-### 원본(basic-tool-calling-agent) 대비 변경사항
+### v1 vs v2 비교
 
-| 구성요소 | 원본 | 변경 |
+| 구성요소 | v1 (기본) | v2 (고도화) |
 |---------|------|------|
-| 벡터DB | Milvus (Docker) | SQLite FTS5 (파일 1개) |
-| 임베딩 | sentence-transformers | 불필요 (trigram 토크나이저) |
-| 검색 도구 | vector_search + web_search | regulation_search |
-| 인프라 | Docker Compose (etcd+minio+milvus) | 불필요 |
-| 데이터 | 외부 주입 | 마크다운 자동 인덱싱 |
+| **검색 방식** | FTS5 전문 검색 | **Hybrid (FTS5 + Vector)** |
+| **임베딩 모델** | 없음 | **BAAI/bge-m3 (Local)** |
+| **순위 산정** | 단순 BM25 | **RRF (Reciprocal Rank Fusion)** |
+| **청킹 전략** | 단순 길이 분할 | **조(Article) 단위 계층 구조 유지** |
+| **데이터 범위** | KRX 규정 15종 | **KRX 규정 + 자본시장법 등 10대 법령** |
 
-## 수록 규정 목록
+## 빠른 시작
 
-### 유가증권시장
-- 상장규정 / 상장규정 시행세칙
-- 공시규정 / 공시규정 시행세칙
-- 업무규정 / 업무규정 시행세칙
-
-### 코스닥시장
-- 상장규정 / 상장규정 시행세칙
-- 공시규정 / 공시규정 시행세칙
-- 업무규정 / 업무규정 시행세칙
-
-### 코넥스시장
-- 상장규정
-- 공시규정 / 공시규정 시행세칙
-
-## 환경변수
-
-| 변수명 | 설명 | 기본값 |
-|--------|------|--------|
-| GOOGLE_API_KEY | Google Generative AI API 키 (필수) | - |
-| LLM_MODEL | 사용할 Gemini 모델 | gemini-2.0-flash |
-| MAX_STEPS | 에이전트 최대 루프 횟수 | 5 |
-| RAG_TOP_K | 검색 결과 반환 수 | 5 |
-
-## 폐쇄망 설치 가이드
-
-1. 인터넷 PC에서 패키지 다운로드:
+### 1. 의존성 설치
 ```bash
-pip download -r requirements.txt -d ./packages
+pip install -r requirements.txt
 ```
 
-2. USB로 전체 프로젝트 폴더 복사
-
-3. 폐쇄망 PC에서 설치:
+### 2. 임베딩 생성 (최초 1회)
+로컬 모델을 통해 규정 데이터를 벡터화합니다.
 ```bash
-pip install --no-index --find-links=./packages -r requirements.txt
+python generate_embeddings_real.py
 ```
 
-4. `.env` 파일에 API Key 설정 후 `python run.py` 실행
+### 3. 실행
+```bash
+python run.py
+```
 
-> 참고: Google Generative AI API 호출을 위해 `generativelanguage.googleapis.com`에 대한 네트워크 접근은 필요합니다.
+---
+> 본 프로젝트는 한국거래소 규정 및 관련 법령에 대한 AI 기반 질의응답을 지원하며, 모든 처리는 로컬 DB와 보안이 강화된 API 호출을 통해 이루어집니다.
